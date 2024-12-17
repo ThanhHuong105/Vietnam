@@ -2,7 +2,10 @@ import logging
 import pandas as pd
 import random
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import (
+    Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+)
+from apscheduler.jobstores.base import ConflictingIdError
 
 # Bot Constants
 TOKEN = "7815935889:AAEkxqMcB8dY-cFrv7wf1zG2jSALT_htJ-A"
@@ -17,7 +20,7 @@ def load_questions():
     try:
         data = pd.read_csv(SHEET_URL)
         questions = data.to_dict(orient="records")
-        
+
         # Kiểm tra dữ liệu hợp lệ
         valid_questions = []
         for q in questions:
@@ -25,7 +28,6 @@ def load_questions():
                 valid_questions.append(q)
             else:
                 logger.warning(f"Invalid question data: {q}")
-
         random.shuffle(valid_questions)
         return valid_questions[:20]
     except Exception as e:
@@ -43,13 +45,12 @@ def start(update: Update, context: CallbackContext):
         return
 
     update.message.reply_text(
-        "🎉 Chào mừng bạn đến với Quiz 'Tìm hiểu Việt Nam'!\n\n"
+        "🎉 Chào mừng bạn đến với Gameshow 'Tìm Hiểu Việt Nam'!\n\n"
         "📜 *Luật chơi:*\n"
         "- Có 20 câu hỏi.\n"
         "- Mỗi câu trả lời đúng được 1 điểm.\n"
-        "- Mỗi câu hỏi sẽ có 4 lựa chọn (1, 2, 3, 4).\n"
         "- Nếu không trả lời trong 60 giây, bạn sẽ bị tính 0 điểm.\n\n"
-        "🔥 Nhấn /quiz để bắt đầu trả lời các câu hỏi!"
+        "🔥 Bạn đã sẵn sàng? Nhấn /quiz để bắt đầu trả lời các câu hỏi!"
     )
 
 # Quiz Command
@@ -64,17 +65,23 @@ def quiz(update: Update, context: CallbackContext):
 
     ask_question(update, context)
 
-# Ask Question
+# Ask Next Question
 def ask_question(update: Update, context: CallbackContext):
     user_data = context.user_data
     current = user_data["current_question"]
     questions = user_data["questions"]
 
+    # Hủy job timeout cũ nếu tồn tại
+    if "timeout_job" in user_data and user_data["timeout_job"] is not None:
+        try:
+            user_data["timeout_job"].remove()
+        except ConflictingIdError:
+            pass
+
     if current < len(questions):
         question = questions[current]
         options = [question["Option 1"], question["Option 2"], question["Option 3"], question["Option 4"]]
         user_data["current_question"] += 1
-        user_data["current_question_data"] = question
 
         reply_markup = ReplyKeyboardMarkup([[1, 2, 3, 4]], one_time_keyboard=True)
         update.message.reply_text(
@@ -86,8 +93,9 @@ def ask_question(update: Update, context: CallbackContext):
             reply_markup=reply_markup,
         )
 
-        # Đặt timeout
-        context.job_queue.run_once(timeout_handler, 60, context=update.message.chat_id)
+        # Đặt timeout mới
+        timeout_job = context.job_queue.run_once(timeout_handler, 60, context=update.message.chat_id)
+        user_data["timeout_job"] = timeout_job
     else:
         finish_quiz(update, context)
 
@@ -96,39 +104,24 @@ def timeout_handler(context: CallbackContext):
     chat_id = context.job.context
     bot = context.bot
 
-    bot.send_message(
-        chat_id=chat_id,
-        text="⏳ Hết thời gian cho câu này! Chuyển sang câu hỏi tiếp theo."
-    )
-    ask_question_via_context(context, chat_id)
-
-# Ask Question via Context
-def ask_question_via_context(context: CallbackContext, chat_id):
-    user_data = context.dispatcher.user_data[chat_id]
-    current = user_data["current_question"]
-    questions = user_data["questions"]
+    user_data = context.dispatcher.user_data.get(chat_id, {})
+    current = user_data.get("current_question", 0)
+    questions = user_data.get("questions", [])
 
     if current < len(questions):
-        question = questions[current]
-        options = [question["Option 1"], question["Option 2"], question["Option 3"], question["Option 4"]]
-        user_data["current_question"] += 1
-        user_data["current_question_data"] = question
-
-        context.bot.send_message(
+        bot.send_message(
             chat_id=chat_id,
-            text=f"💬 *Câu {current + 1}:* {question['Question']}\n\n"
-                 f"1️⃣ {options[0]}\n"
-                 f"2️⃣ {options[1]}\n"
-                 f"3️⃣ {options[2]}\n"
-                 f"4️⃣ {options[3]}",
-            reply_markup=ReplyKeyboardMarkup([[1, 2, 3, 4]], one_time_keyboard=True),
+            text=f"⏳ Hết thời gian cho câu này! Tổng điểm hiện tại của bạn là {user_data['score']}/20."
         )
+        ask_question_via_context(context, chat_id)
+    else:
+        finish_quiz_via_context(context, chat_id)
 
 # Handle Answer
 def handle_answer(update: Update, context: CallbackContext):
     user_data = context.user_data
-    current_question = user_data["current_question_data"]
-    correct_answer = int(current_question["Answer"])
+    current = user_data["current_question"] - 1
+    questions = user_data["questions"]
 
     try:
         user_answer = int(update.message.text)
@@ -136,22 +129,27 @@ def handle_answer(update: Update, context: CallbackContext):
         update.message.reply_text("⚠️ Vui lòng chọn 1, 2, 3 hoặc 4.")
         return
 
+    correct_answer = int(questions[current]["Answer"])
+    explanation = questions[current]["Explanation"]
+
     if user_answer == correct_answer:
         user_data["score"] += 1
-        update.message.reply_text("✅ Chính xác!")
+        update.message.reply_text(f"👍 Chính xác! Tổng điểm hiện tại của bạn là {user_data['score']}/20.\n\n💡 {explanation}")
     else:
         update.message.reply_text(
-            f"❌ Sai rồi! Đáp án đúng là {correct_answer}: {current_question[f'Option {correct_answer}']}.\n\n"
-            f"ℹ️ {current_question['Explanation']}"
+            f"😥 Sai rồi! Đáp án đúng là {correct_answer}. "
+            f"Tổng điểm hiện tại của bạn là {user_data['score']}/20.\n\n💡 {explanation}"
         )
 
     ask_question(update, context)
 
 # Finish Quiz
 def finish_quiz(update: Update, context: CallbackContext):
-    score = context.user_data.get("score", 0)
+    user_data = context.user_data
+    score = user_data.get("score", 0)
+
     update.message.reply_text(
-        f"🎉 *Chúc mừng bạn đã hoàn thành Quiz 'Tìm hiểu Việt Nam'!*\n"
+        f"🎉 *Chúc mừng bạn đã hoàn thành Gameshow 'Tìm Hiểu Việt Nam'!*\n\n"
         f"🏆 *Tổng điểm của bạn:* {score}/20."
     )
 
@@ -159,6 +157,9 @@ def finish_quiz(update: Update, context: CallbackContext):
 def main():
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
+
+    # Xóa tất cả jobs khi bot khởi động
+    updater.job_queue.scheduler.remove_all_jobs()
 
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("quiz", quiz))
